@@ -16,8 +16,23 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
 import os from 'os';
-import {createEmailMessage} from "./utl.js";
+import { createEmailMessage } from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
+import { GmailApiError, AuthenticationError, ValidationError, RateLimitError } from "./error-handler.js";
+import { logger } from "./error-logger.js";
+import { validateEmail, validateEmailAddress, validateEmailContent } from "./email-validator.js";
+
+// Set up global unhandled error handling
+process.on('uncaughtException', (error) => {
+    console.error('UNHANDLED EXCEPTION:', error);
+    // Attempt to exit gracefully
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('UNHANDLED REJECTION:', reason);
+    // Do not exit to allow potential recovery
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -92,11 +107,23 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
     return { text: textContent, html: htmlContent };
 }
 
+/**
+ * Loads API credentials and sets up OAuth2 client
+ * @returns Configured OAuth2 client
+ * @throws AuthenticationError if credentials cannot be loaded
+ */
 async function loadCredentials() {
     try {
+        logger.info('Loading API credentials');
+        
         // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
+            try {
+                fs.mkdirSync(CONFIG_DIR, { recursive: true });
+                logger.debug(`Created config directory: ${CONFIG_DIR}`);
+            } catch (error: any) {
+                throw new AuthenticationError(`Failed to create config directory: ${error.message}`);
+            }
         }
 
         // Check for OAuth keys in current directory first, then in config directory
@@ -104,27 +131,41 @@ async function loadCredentials() {
         let oauthPath = OAUTH_PATH;
 
         if (fs.existsSync(localOAuthPath)) {
-            // If found in current directory, copy to config directory
-            fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
+            try {
+                // If found in current directory, copy to config directory
+                fs.copyFileSync(localOAuthPath, OAUTH_PATH);
+                logger.info('OAuth keys found in current directory, copied to global config.');
+            } catch (error: any) {
+                logger.warn(`Could not copy OAuth keys to config directory: ${error.message}`);
+                // Continue using the local file
+                oauthPath = localOAuthPath;
+            }
         }
 
-        if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
+        if (!fs.existsSync(oauthPath)) {
+            throw new AuthenticationError(
+                `OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or ${CONFIG_DIR}`
+            );
         }
 
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+        let keysContent;
+        try {
+            keysContent = JSON.parse(fs.readFileSync(oauthPath, 'utf8'));
+        } catch (error: any) {
+            throw new AuthenticationError(`Failed to parse OAuth keys file: ${error.message}`);
+        }
+
         const keys = keysContent.installed || keysContent.web;
 
         if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-            process.exit(1);
+            throw new AuthenticationError(
+                'Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.'
+            );
         }
 
         const callback = process.argv[2] === 'auth' && process.argv[3] 
-        ? process.argv[3] 
-        : "http://localhost:3000/oauth2callback";
+            ? process.argv[3] 
+            : "http://localhost:3000/oauth2callback";
 
         oauth2Client = new OAuth2Client(
             keys.client_id,
@@ -133,56 +174,162 @@ async function loadCredentials() {
         );
 
         if (fs.existsSync(CREDENTIALS_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-            oauth2Client.setCredentials(credentials);
+            try {
+                const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+                oauth2Client.setCredentials(credentials);
+                logger.info('Loaded existing OAuth credentials');
+            } catch (error: any) {
+                logger.warn(`Failed to load saved credentials: ${error.message}. Will need to re-authenticate.`);
+                // We'll continue without credentials and authenticate later
+            }
+        } else {
+            logger.info('No saved credentials found. Authentication will be required.');
         }
-    } catch (error) {
-        console.error('Error loading credentials:', error);
-        process.exit(1);
+        
+        return oauth2Client;
+    } catch (error: any) {
+        // Transform generic errors into authentication errors
+        if (!(error instanceof AuthenticationError)) {
+            error = new AuthenticationError(
+                `Failed to load credentials: ${error.message || 'Unknown error'}`
+            );
+        }
+        
+        logger.error('Authentication error', { message: error.message }, error);
+        throw error;
     }
 }
 
+/**
+ * Handles the OAuth2 authentication flow with Google
+ * @returns Promise that resolves when authentication is complete
+ * @throws AuthenticationError if authentication fails
+ */
 async function authenticate() {
+    logger.info('Starting authentication process');
     const server = http.createServer();
-    server.listen(3000);
+    
+    try {
+        server.listen(3000);
+    } catch (error: any) {
+        throw new AuthenticationError(
+            `Failed to start authentication server: ${error.message}. ` +
+            'Port 3000 might be in use by another application.'
+        );
+    }
 
     return new Promise<void>((resolve, reject) => {
-        const authUrl = oauth2Client.generateAuthUrl({
-            access_type: 'offline',
-            scope: ['https://www.googleapis.com/auth/gmail.modify'],
-        });
+        // Configure authentication timeout
+        const timeout = setTimeout(() => {
+            server.close();
+            reject(new AuthenticationError('Authentication timed out after 5 minutes'));
+        }, 5 * 60 * 1000); // 5 minute timeout
 
-        console.log('Please visit this URL to authenticate:', authUrl);
-        open(authUrl);
+        try {
+            const authUrl = oauth2Client.generateAuthUrl({
+                access_type: 'offline',
+                scope: ['https://www.googleapis.com/auth/gmail.modify'],
+                prompt: 'consent' // Always ask for consent to ensure refresh token
+            });
 
-        server.on('request', async (req, res) => {
-            if (!req.url?.startsWith('/oauth2callback')) return;
+            logger.info('Authentication URL generated');
+            console.log('Please visit this URL to authenticate:', authUrl);
+            
+            // Try to open the URL in the default browser
+            open(authUrl).catch(error => {
+                logger.warn(`Could not automatically open browser: ${error.message}`);
+                console.log('Please manually copy and paste the URL into your browser.');
+            });
 
-            const url = new URL(req.url, 'http://localhost:3000');
-            const code = url.searchParams.get('code');
+            server.on('request', async (req, res) => {
+                if (!req.url?.startsWith('/oauth2callback')) return;
 
-            if (!code) {
-                res.writeHead(400);
-                res.end('No code provided');
-                reject(new Error('No code provided'));
-                return;
-            }
+                // Clear the timeout since we got a response
+                clearTimeout(timeout);
 
-            try {
-                const { tokens } = await oauth2Client.getToken(code);
-                oauth2Client.setCredentials(tokens);
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+                const url = new URL(req.url, 'http://localhost:3000');
+                const code = url.searchParams.get('code');
+                const error = url.searchParams.get('error');
 
-                res.writeHead(200);
-                res.end('Authentication successful! You can close this window.');
-                server.close();
-                resolve();
-            } catch (error) {
-                res.writeHead(500);
-                res.end('Authentication failed');
-                reject(error);
-            }
-        });
+                if (error) {
+                    res.writeHead(400, {'Content-Type': 'text/html'});
+                    res.end(`<html><body><h2>Authentication Error</h2><p>${error}</p></body></html>`);
+                    server.close();
+                    reject(new AuthenticationError(`OAuth error: ${error}`));
+                    return;
+                }
+
+                if (!code) {
+                    res.writeHead(400, {'Content-Type': 'text/html'});
+                    res.end('<html><body><h2>Error</h2><p>No authorization code provided</p></body></html>');
+                    server.close();
+                    reject(new AuthenticationError('No authorization code provided'));
+                    return;
+                }
+
+                try {
+                    logger.debug('Exchanging authorization code for tokens');
+                    const { tokens } = await oauth2Client.getToken(code);
+                    
+                    // Verify we got the required tokens
+                    if (!tokens.access_token) {
+                        throw new AuthenticationError('No access token received');
+                    }
+                    
+                    oauth2Client.setCredentials(tokens);
+                    
+                    // Ensure credentials directory exists
+                    if (!fs.existsSync(path.dirname(CREDENTIALS_PATH))) {
+                        fs.mkdirSync(path.dirname(CREDENTIALS_PATH), { recursive: true });
+                    }
+                    
+                    try {
+                        fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+                        logger.info('Saved authentication tokens to disk');
+                    } catch (error: any) {
+                        logger.error(`Failed to save credentials: ${error.message}`);
+                        // Continue anyway as we have credentials in memory
+                    }
+
+                    res.writeHead(200, {'Content-Type': 'text/html'});
+                    res.end(`
+                        <html>
+                            <body>
+                                <h2>Authentication Successful!</h2>
+                                <p>You can close this window and return to the application.</p>
+                            </body>
+                        </html>
+                    `);
+                    server.close();
+                    logger.info('Authentication completed successfully');
+                    resolve();
+                } catch (error: any) {
+                    const errorMessage = error.message || 'Unknown error';
+                    logger.error(`Authentication failed: ${errorMessage}`, { error });
+                    
+                    res.writeHead(500, {'Content-Type': 'text/html'});
+                    res.end(`
+                        <html>
+                            <body>
+                                <h2>Authentication Failed</h2>
+                                <p>${errorMessage}</p>
+                            </body>
+                        </html>
+                    `);
+                    server.close();
+                    reject(new AuthenticationError(
+                        `Failed to obtain access token: ${errorMessage}`
+                    ));
+                }
+            });
+        } catch (error: any) {
+            clearTimeout(timeout);
+            server.close();
+            logger.error('Authentication setup failed', { error });
+            reject(new AuthenticationError(
+                `Authentication setup failed: ${error.message || 'Unknown error'}`
+            ));
+        }
     });
 }
 
@@ -260,30 +407,71 @@ const BatchDeleteEmailsSchema = z.object({
     batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
 });
 
-// Main function
-async function main() {
-    await loadCredentials();
-
-    if (process.argv[2] === 'auth') {
-        await authenticate();
-        console.log('Authentication completed successfully');
-        process.exit(0);
+/**
+ * Helper function to wrap API calls with error handling
+ * @param apiCall Function that makes the API call
+ * @param errorMessage Message to use if the call fails
+ * @returns Result of the API call
+ */
+async function withApiErrorHandling<T>(apiCall: () => Promise<T>, errorMessage: string): Promise<T> {
+    try {
+        return await apiCall();
+    } catch (error: any) {
+        logger.error(`API Error: ${errorMessage}`, { errorDetails: error.message });
+        
+        // Check for specific error types
+        if (error.code === 401 || error.code === 403) {
+            throw new AuthenticationError(`Authentication error: ${error.message}`);
+        }
+        
+        if (error.code === 429 || (error.message && error.message.includes('quota'))) {
+            throw new RateLimitError('Rate limit exceeded', 3600); // Suggest retry after 1 hour
+        }
+        
+        // Generic API error
+        throw new GmailApiError(
+            `${errorMessage}: ${error.message || 'Unknown error'}`,
+            error.code || 500,
+            error.errors?.[0]?.reason || 'api_error'
+        );
     }
+}
 
-    // Initialize Gmail API
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+/**
+ * Main function to run the MCP server
+ */
+async function main() {
+    try {
+        logger.info('Starting Gmail MCP Server');
+        
+        // Load credentials with error handling
+        await loadCredentials();
 
-    // Server implementation
-    const server = new Server({
-        name: "gmail",
-        version: "1.0.0",
-        capabilities: {
-            tools: {},
-        },
-    });
+        // Handle authentication if requested
+        if (process.argv[2] === 'auth') {
+            await authenticate();
+            logger.info('Authentication completed successfully');
+            console.log('Authentication completed successfully');
+            process.exit(0);
+        }
 
-    // Tool handlers
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+        // Initialize Gmail API
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        logger.info('Gmail API initialized');
+
+        // Server implementation
+        const server = new Server({
+            name: "gmail",
+            version: "1.0.0",
+            capabilities: {
+                tools: {},
+            },
+        });
+        
+        logger.info('MCP Server created');
+        
+        // Tool handlers
+        server.setRequestHandler(ListToolsRequestSchema, async () => ({
         tools: [
             {
                 name: "send_email",
@@ -356,59 +544,171 @@ async function main() {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
 
+        /**
+         * Handles sending or drafting an email with validation and error handling
+         * @param action Action to perform: "send" or "draft"
+         * @param validatedArgs Validated email arguments
+         * @returns API response data
+         */
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
-            const message = createEmailMessage(validatedArgs);
-
-            const encodedMessage = Buffer.from(message).toString('base64')
-                .replace(/\+/g, '-')
-                .replace(/\//g, '_')
-                .replace(/=+$/, '');
-
-            // Define the type for messageRequest
-            interface GmailMessageRequest {
-                raw: string;
-                threadId?: string;
-            }
-
-            const messageRequest: GmailMessageRequest = {
-                raw: encodedMessage,
-            };
-
-            // Add threadId if specified
-            if (validatedArgs.threadId) {
-                messageRequest.threadId = validatedArgs.threadId;
-            }
-
-            if (action === "send") {
-                const response = await gmail.users.messages.send({
-                    userId: 'me',
-                    requestBody: messageRequest,
+            try {
+                const { to, cc, bcc, subject, body, threadId } = validatedArgs;
+                
+                // Validate email addresses
+                logger.debug('Validating email addresses');
+                
+                // Helper function to validate an email address
+                // Use the imported validateEmailAddress function from email-validator.ts
+                function checkEmail(email: string, fieldName: string): void {
+                    // Import the function from email-validator.ts
+                    const result = validateEmailAddress(email);
+                    if (!result.valid) {
+                        throw new ValidationError(
+                            `Invalid ${fieldName} email address: ${email} - ${result.reason}`,
+                            { [fieldName]: [result.reason || 'Invalid email format'] }
+                        );
+                    }
+                }
+                
+                // Validate 'to' addresses
+                for (const email of to) {
+                    checkEmail(email, 'to');
+                }
+                
+                // Validate 'cc' addresses if present
+                if (cc && cc.length > 0) {
+                    for (const email of cc) {
+                        checkEmail(email, 'cc');
+                    }
+                }
+                
+                // Validate 'bcc' addresses if present
+                if (bcc && bcc.length > 0) {
+                    for (const email of bcc) {
+                        checkEmail(email, 'bcc');
+                    }
+                }
+                
+                // Validate subject
+                if (!subject || subject.trim() === '') {
+                    throw new ValidationError('Email subject cannot be empty', 
+                        { subject: ['Subject is required'] }
+                    );
+                }
+                
+                // Log information about the email being created
+                logger.info(`Creating ${action === 'send' ? 'email' : 'draft'}`, { 
+                    to: to.length, 
+                    cc: cc?.length || 0, 
+                    bcc: bcc?.length || 0,
+                    hasThreadId: !!threadId
                 });
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Email sent successfully with ID: ${response.data.id}`,
-                        },
-                    ],
-                };
-            } else {
-                const response = await gmail.users.drafts.create({
-                    userId: 'me',
-                    requestBody: {
-                        message: messageRequest,
-                    },
+                
+                // Create the raw email message
+                const message = await createEmailMessage({
+                    to: to.join(','),
+                    cc: cc ? cc.join(',') : undefined,
+                    bcc: bcc ? bcc.join(',') : undefined,
+                    subject,
+                    text: typeof body === 'string' ? body : body.text,
+                    html: typeof body === 'string' ? undefined : body.html
                 });
-                return {
-                    content: [
-                        {
+                
+                const encodedMessage = Buffer.from(message).toString('base64')
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_')
+                    .replace(/=+$/, '');
+                
+                // Create message request object
+                const messageRequest: { raw: string; threadId?: string } = {
+                    raw: encodedMessage
+                };
+                
+                // Add threadId if provided
+                if (threadId) {
+                    messageRequest.threadId = threadId;
+                }
+                
+                try {
+                    // Send or create draft based on action
+                    if (action === "send") {
+                        const response = await gmail.users.messages.send({
+                            userId: 'me',
+                            requestBody: messageRequest,
+                        });
+                        
+                        logger.info('Email sent successfully', { messageId: response.data.id });
+                        
+                        return {
+                            content: [{
+                                type: "text",
+                                text: `Email sent successfully with ID: ${response.data.id}`,
+                            }],
+                        };
+                    } else {
+                        const response = await gmail.users.drafts.create({
+                            userId: 'me',
+                            requestBody: {
+                                message: messageRequest,
+                            },
+                        });
+                        
+                        logger.info('Email draft created successfully', { draftId: response.data.id });
+                        
+                        return {
+                            content: [{
+                                type: "text",
+                                text: `Email draft created successfully with ID: ${response.data.id}`,
+                            }],
+                        };
+                    }
+                } catch (apiError: any) {
+                    // Handle API-specific errors
+                    logger.error(`Failed to ${action} email`, { error: apiError.message });
+                    
+                    if (apiError.code === 401 || apiError.code === 403) {
+                        throw new AuthenticationError(`Authentication error: ${apiError.message}`);
+                    }
+                    
+                    if (apiError.code === 429 || (apiError.message && apiError.message.includes('quota'))) {
+                        throw new RateLimitError('Rate limit exceeded', 3600);
+                    }
+                    
+                    throw new GmailApiError(
+                        `Failed to ${action} email: ${apiError.message || 'Unknown error'}`,
+                        apiError.code || 500,
+                        apiError.errors?.[0]?.reason || 'api_error'
+                    );
+                }
+            } catch (error: any) {
+                // Create appropriate error response
+                logger.error(`Email ${action} error`, { 
+                    message: error.message,
+                    errorType: error.constructor.name 
+                });
+                
+                if (error instanceof ValidationError || 
+                    error instanceof AuthenticationError || 
+                    error instanceof GmailApiError || 
+                    error instanceof RateLimitError) {
+                    // Use our custom error types directly
+                    return {
+                        content: [{
                             type: "text",
-                            text: `Email draft created successfully with ID: ${response.data.id}`,
-                        },
-                    ],
+                            text: `Error: ${error.message}`,
+                        }],
+                    };
+                }
+                
+                // Generic error handling
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error ${action}ing email: ${error.message || 'Unknown error'}`,
+                    }],
                 };
             }
-        }
+        } // End of handleEmailAction function
 
         // Helper function to process operations in batches
         async function processBatches<T, U>(
@@ -816,8 +1116,48 @@ async function main() {
         }
     });
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+        const transport = new StdioServerTransport();
+        server.connect(transport);
+        
+        logger.info('Server connected to transport and running');
+    } catch (error: any) {
+        // Handle different types of errors appropriately
+        logger.error('Server initialization error', { 
+            message: error.message, 
+            stack: error.stack,
+            errorType: error.constructor.name
+        });
+        
+        // Different handling based on error type
+        if (error instanceof AuthenticationError) {
+            console.error('Authentication error:', error.message);
+            console.log(`Status code: ${error.statusCode}`);
+            console.log('Try running with the "auth" command to re-authenticate.');
+        } else if (error instanceof GmailApiError) {
+            console.error('Gmail API error:', error.message);
+            console.log(`Status code: ${error.statusCode}, Error code: ${error.errorCode}`);
+            if (error.requestId) {
+                console.log(`Request ID: ${error.requestId}`);
+            }
+        } else if (error instanceof RateLimitError) {
+            console.error('Rate limit exceeded:', error.message);
+            if (error.retryAfter) {
+                console.log(`Please try again after ${error.retryAfter} seconds.`);
+            }
+        } else if (error instanceof ValidationError) {
+            console.error('Validation error:', error.message);
+            if (Object.keys(error.fieldErrors).length > 0) {
+                console.log('Field errors:');
+                for (const [field, errors] of Object.entries(error.fieldErrors)) {
+                    console.log(`  ${field}: ${errors.join(', ')}`);
+                }
+            }
+        } else {
+            console.error('Unexpected error:', error.message);
+        }
+        
+        process.exit(1);
+    }
 }
 
 main().catch((error) => {
