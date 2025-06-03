@@ -2,6 +2,7 @@ from typing import Any
 import argparse
 import os
 import asyncio
+import json
 import logging
 import base64
 from email.message import EmailMessage
@@ -15,20 +16,18 @@ import mcp.types as types
 from mcp.server import NotificationOptions, Server
 import mcp.server.stdio
 
-
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 EMAIL_ADMIN_PROMPTS = """You are an email administrator. 
-You can draft, edit, read, trash, open, and send emails.
+You can draft, read, trash, open, and send emails.
 You've been given access to a specific gmail account. 
 You have the following tools available:
 - Send an email (send-email)
@@ -42,21 +41,7 @@ You have the following tools available:
 - Create a new label (create-label)
 - Apply a label to an email (apply-label)
 - Remove a label from an email (remove-label)
-- Rename a label (rename-label)
-- Delete a label (delete-label)
-- Search for emails with a specific label (search-by-label)
 - Search for emails using Gmail's search syntax (search-emails)
-- List all email filters (list-filters)
-- Get details of a specific filter (get-filter)
-- Create a new email filter (create-filter)
-- Delete a filter (delete-filter)
-- Create a new folder (create-folder)
-- Move an email to a folder (move-to-folder)
-- List all folders (list-folders)
-- Archive an email (archive-email)
-- Batch archive emails (batch-archive)
-- List archived emails (list-archived)
-- Restore an email to inbox (restore-to-inbox)
 
 Never send an email draft or trash an email unless the user confirms first. 
 Always ask for approval if not already given.
@@ -66,12 +51,12 @@ Always ask for approval if not already given.
 PROMPTS = {
     "manage-email": types.Prompt(
         name="manage-email",
-        description="Act like an email administator",
+        description="Act like an email administrator",
         arguments=None,
     ),
     "draft-email": types.Prompt(
         name="draft-email",
-        description="Draft an email with cotent and recipient",
+        description="Draft an email with content and recipient",
         arguments=[
             types.PromptArgument(
                 name="content",
@@ -112,18 +97,7 @@ PROMPTS = {
         arguments=[
             types.PromptArgument(
                 name="action",
-                description="What action to take with labels (create, list, apply, remove, search)",
-                required=True
-            ),
-        ],
-    ),
-    "manage-filters": types.Prompt(
-        name="manage-filters",
-        description="Manage email filters for automation",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with filters (create, list, view, delete)",
+                description="What action to take with labels (create, list, apply, remove)",
                 required=True
             ),
         ],
@@ -139,42 +113,17 @@ PROMPTS = {
             ),
         ],
     ),
-    "manage-folders": types.Prompt(
-        name="manage-folders",
-        description="Manage email folders for organization",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with folders (create, list, move)",
-                required=True
-            ),
-        ],
-    ),
-    "manage-archive": types.Prompt(
-        name="manage-archive",
-        description="Manage archived emails",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with archives (archive, batch-archive, list, restore)",
-                required=True
-            ),
-        ],
-    ),
 }
 
 
 def decode_mime_header(header: str) -> str: 
     """Helper function to decode encoded email headers"""
-    
     decoded_parts = decode_header(header)
     decoded_string = ''
     for part, encoding in decoded_parts: 
         if isinstance(part, bytes): 
-            # Decode bytes to string using the specified encoding 
             decoded_string += part.decode(encoding or 'utf-8') 
         else: 
-            # Already a string 
             decoded_string += part 
     return decoded_string
 
@@ -189,251 +138,193 @@ class GmailService:
         self.token_path = token_path
         self.scopes = scopes
         self.token = self._get_token()
-        logger.info("Token retrieved successfully")
         self.service = self._get_service()
-        logger.info("Gmail service initialized")
         self.user_email = self._get_user_email()
-        logger.info(f"User email retrieved: {self.user_email}")
+        logger.info(f"Gmail service initialized for: {self.user_email}")
 
     def _get_token(self) -> Credentials:
         """Get or refresh Google API token"""
-
         token = None
     
         if os.path.exists(self.token_path):
-            logger.info('Loading token from file')
-            token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
-
+            try:
+                token = Credentials.from_authorized_user_info(
+                    json.loads(open(self.token_path).read()),
+                    self.scopes
+                )
+            except Exception as e:
+                logger.error(f"Error loading token: {str(e)}")
+                
+        # Get new token if needed
         if not token or not token.valid:
             if token and token.expired and token.refresh_token:
-                logger.info('Refreshing token')
                 token.refresh(Request())
             else:
-                logger.info('Fetching new token')
                 flow = InstalledAppFlow.from_client_secrets_file(self.creds_file_path, self.scopes)
                 token = flow.run_local_server(port=0)
-
+                
+            # Save token
             with open(self.token_path, 'w') as token_file:
                 token_file.write(token.to_json())
-                logger.info(f'Token saved to {self.token_path}')
-
+                
         return token
 
-    def _get_service(self) -> Any:
+    def _get_service(self):
         """Initialize Gmail API service"""
-        try:
-            service = build('gmail', 'v1', credentials=self.token)
-            return service
-        except HttpError as error:
-            logger.error(f'An error occurred building Gmail service: {error}')
-            raise ValueError(f'An error occurred: {error}')
-    
+        return build('gmail', 'v1', credentials=self.token)
+
     def _get_user_email(self) -> str:
         """Get user email address"""
         profile = self.service.users().getProfile(userId='me').execute()
-        user_email = profile.get('emailAddress', '')
-        return user_email
-    
-    async def send_email(self, recipient_id: str, subject: str, message: str,) -> dict:
+        return profile['emailAddress']
+
+    async def send_email(self, recipient_id: str, subject: str, message_content: str) -> dict:
         """Creates and sends an email message"""
         try:
-            message_obj = EmailMessage()
-            message_obj.set_content(message)
-            
-            message_obj['To'] = recipient_id
-            message_obj['From'] = self.user_email
-            message_obj['Subject'] = subject
+            message = EmailMessage()
+            message["To"] = recipient_id
+            message["From"] = self.user_email
+            message["Subject"] = subject
+            message.set_content(message_content)
 
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            # Encode message
+            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
             create_message = {'raw': encoded_message}
-            
-            send_message = await asyncio.to_thread(
-                self.service.users().messages().send(userId="me", body=create_message).execute
-            )
-            logger.info(f"Message sent: {send_message['id']}")
-            return {"status": "success", "message_id": send_message["id"]}
+
+            send_message = self.service.users().messages().send(userId="me", body=create_message).execute()
+            return {"status": "success", "message_id": send_message['id']}
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
 
-    async def open_email(self, email_id: str) -> str:
+    async def open_email(self, email_id: str) -> dict:
         """Opens email in browser given ID."""
         try:
-            url = f"https://mail.google.com/#all/{email_id}"
-            webbrowser.open(url, new=0, autoraise=True)
-            return "Email opened in browser successfully."
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            email_url = f"https://mail.google.com/mail/u/0/#inbox/{email_id}"
+            webbrowser.open(email_url)
+            return {"status": "success", "message": f"Email opened in browser"}
+        except Exception as e:
+            return {"status": "error", "error_message": str(e)}
 
-    async def get_unread_emails(self) -> list[dict[str, str]]| str:
-        """
-        Retrieves unread messages from mailbox.
-        Returns list of messsage IDs in key 'id'."""
+    async def get_unread_emails(self):
+        """Retrieves unread messages from mailbox."""
         try:
-            user_id = 'me'
-            query = 'in:inbox is:unread category:primary'
-
-            response = self.service.users().messages().list(userId=user_id,
-                                                        q=query).execute()
-            messages = []
-            if 'messages' in response:
-                messages.extend(response['messages'])
-
-            while 'nextPageToken' in response:
-                page_token = response['nextPageToken']
-                response = self.service.users().messages().list(userId=user_id, q=query,
-                                                    pageToken=page_token).execute()
-                messages.extend(response['messages'])
-            return messages
-
+            response = self.service.users().messages().list(userId="me", q='is:unread').execute()
+            return response.get('messages', [])
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
 
-    async def read_email(self, email_id: str) -> dict[str, str]| str:
-        """Retrieves email contents including to, from, subject, and contents."""
+    async def read_email(self, email_id: str):
+        """Retrieves email contents including metadata and body."""
         try:
+            # Get the email in raw format
             msg = self.service.users().messages().get(userId="me", id=email_id, format='raw').execute()
-            email_metadata = {}
-
-            # Decode the base64URL encoded raw content
-            raw_data = msg['raw']
-            decoded_data = urlsafe_b64decode(raw_data)
-
-            # Parse the RFC 2822 email
+            # Decode the email
+            decoded_data = urlsafe_b64decode(msg['raw'])
             mime_message = message_from_bytes(decoded_data)
-
-            # Extract the email body
-            body = None
+            
+            # Extract the body
+            body = ""
             if mime_message.is_multipart():
                 for part in mime_message.walk():
-                    # Extract the text/plain part
                     if part.get_content_type() == "text/plain":
                         body = part.get_payload(decode=True).decode()
                         break
             else:
-                # For non-multipart messages
                 body = mime_message.get_payload(decode=True).decode()
-            email_metadata['content'] = body
             
-            # Extract metadata
-            email_metadata['subject'] = decode_mime_header(mime_message.get('subject', ''))
-            email_metadata['from'] = mime_message.get('from','')
-            email_metadata['to'] = mime_message.get('to','')
-            email_metadata['date'] = mime_message.get('date','')
+            # Mark email as read
+            self.service.users().messages().modify(
+                userId="me", id=email_id, body={'removeLabelIds': ['UNREAD']}
+            ).execute()
             
-            logger.info(f"Email read: {email_id}")
-            
-            # We want to mark email as read once we read it
-            await self.mark_email_as_read(email_id)
-
-            return email_metadata
+            return {
+                'subject': decode_mime_header(mime_message.get('subject', '')),
+                'from': mime_message.get('from', ''),
+                'to': mime_message.get('to', ''),
+                'date': mime_message.get('date', ''),
+                'content': body
+            }
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
         
-    async def trash_email(self, email_id: str) -> str:
+    async def trash_email(self, email_id: str):
         """Moves email to trash given ID."""
         try:
             self.service.users().messages().trash(userId="me", id=email_id).execute()
-            logger.info(f"Email moved to trash: {email_id}")
-            return "Email moved to trash successfully."
+            return {"status": "success", "message": "Email moved to trash successfully"}
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-        
-    async def mark_email_as_read(self, email_id: str) -> str:
-        """Marks email as read given ID."""
-        try:
-            self.service.users().messages().modify(userId="me", id=email_id, body={'removeLabelIds': ['UNREAD']}).execute()
-            logger.info(f"Email marked as read: {email_id}")
-            return "Email marked as read."
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
-    async def create_draft(self, recipient_id: str, subject: str, message: str) -> dict:
+    async def create_draft(self, recipient_id: str, subject: str, message: str):
         """Creates a draft email message"""
         try:
-            message_obj = EmailMessage()
-            message_obj.set_content(message)
+            # Create the email message
+            email_msg = EmailMessage()
+            email_msg['To'] = recipient_id
+            email_msg['From'] = self.user_email
+            email_msg['Subject'] = subject
+            email_msg.set_content(message)
             
-            message_obj['To'] = recipient_id
-            message_obj['From'] = self.user_email
-            message_obj['Subject'] = subject
-
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
-            create_message = {'raw': encoded_message}
+            # Encode and create draft
+            encoded_message = base64.urlsafe_b64encode(email_msg.as_bytes()).decode()
+            draft = self.service.users().drafts().create(
+                userId="me", 
+                body={'message': {'raw': encoded_message}}
+            ).execute()
             
-            draft = await asyncio.to_thread(
-                self.service.users().drafts().create(userId="me", body={'message': create_message}).execute
-            )
-            logger.info(f"Draft created: {draft['id']}")
             return {"status": "success", "draft_id": draft["id"]}
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
     
-    async def list_drafts(self) -> list[dict] | str:
+    async def list_drafts(self):
         """Lists all draft emails"""
         try:
-            results = await asyncio.to_thread(
-                self.service.users().drafts().list(userId="me").execute
-            )
+            results = self.service.users().drafts().list(userId="me").execute()
             drafts = results.get('drafts', [])
             
             draft_list = []
             for draft in drafts:
-                draft_id = draft['id']
-                # Get the draft details to extract subject and recipient
-                draft_data = await asyncio.to_thread(
-                    self.service.users().drafts().get(userId="me", id=draft_id).execute
-                )
+                draft_data = self.service.users().drafts().get(
+                    userId="me", id=draft['id']
+                ).execute()
                 
-                message = draft_data.get('message', {})
-                headers = message.get('payload', {}).get('headers', [])
-                
-                subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
-                to = next((header['value'] for header in headers if header['name'].lower() == 'to'), 'No Recipient')
+                headers = draft_data.get('message', {}).get('payload', {}).get('headers', [])
+                subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                to = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'No Recipient')
                 
                 draft_list.append({
-                    'id': draft_id,
+                    'id': draft['id'],
                     'subject': subject,
                     'to': to
                 })
                 
             return draft_list
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
-    async def list_labels(self) -> list[dict] | str:
+    async def list_labels(self):
         """Lists all labels in the user's mailbox"""
         try:
-            results = await asyncio.to_thread(
-                self.service.users().labels().list(userId="me").execute
-            )
+            results = self.service.users().labels().list(userId="me").execute()
             labels = results.get('labels', [])
-            
-            label_list = []
-            for label in labels:
-                label_list.append({
-                    'id': label['id'],
-                    'name': label['name'],
-                    'type': label['type']  # 'system' or 'user'
-                })
-                
-            return label_list
+            return [{'id': label['id'], 'name': label['name'], 'type': label['type']} 
+                   for label in labels]
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
-    async def create_label(self, name: str) -> dict | str:
+    async def create_label(self, name: str):
         """Creates a new label"""
         try:
             label_object = {
                 'name': name,
-                'labelListVisibility': 'labelShow',  # Show in label list
-                'messageListVisibility': 'show'  # Show in message list
+                'labelListVisibility': 'labelShow',
+                'messageListVisibility': 'show'
             }
             
-            created_label = await asyncio.to_thread(
-                self.service.users().labels().create(userId="me", body=label_object).execute
-            )
+            created_label = self.service.users().labels().create(
+                userId="me", body=label_object
+            ).execute()
             
-            logger.info(f"Label created: {created_label['id']}")
             return {
                 'status': 'success',
                 'label_id': created_label['id'],
@@ -442,76 +333,60 @@ class GmailService:
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
     
-    async def apply_label(self, email_id: str, label_id: str) -> str:
+    async def apply_label(self, email_id: str, label_id: str):
         """Applies a label to an email"""
         try:
-            await asyncio.to_thread(
-                self.service.users().messages().modify(
-                    userId="me", 
-                    id=email_id, 
-                    body={'addLabelIds': [label_id]}
-                ).execute
-            )
-            
-            logger.info(f"Label {label_id} applied to email {email_id}")
-            return f"Label applied successfully to email."
+            self.service.users().messages().modify(
+                userId="me", 
+                id=email_id, 
+                body={'addLabelIds': [label_id]}
+            ).execute()
+            return {"status": "success", "message": "Label applied successfully"}
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
-    async def remove_label(self, email_id: str, label_id: str) -> str:
+    async def remove_label(self, email_id: str, label_id: str):
         """Removes a label from an email"""
         try:
-            await asyncio.to_thread(
-                self.service.users().messages().modify(
-                    userId="me", 
-                    id=email_id, 
-                    body={'removeLabelIds': [label_id]}
-                ).execute
-            )
-            
-            logger.info(f"Label {label_id} removed from email {email_id}")
-            return f"Label removed successfully from email."
+            self.service.users().messages().modify(
+                userId="me", 
+                id=email_id, 
+                body={'removeLabelIds': [label_id]}
+            ).execute()
+            return {"status": "success", "message": "Label removed successfully"}
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
-    async def search_by_label(self, label_id: str) -> list[dict] | str:
-        """Searches for emails with a specific label"""
+    async def search_emails(self, query: str, max_results: int = 20):
+        """Searches for emails using Gmail's search syntax"""
         try:
-            query = f"label:{label_id}"
+            results = self.service.users().messages().list(
+                userId="me", q=query, maxResults=max_results
+            ).execute()
             
-            response = await asyncio.to_thread(
-                self.service.users().messages().list(userId="me", q=query).execute
-            )
+            messages = results.get('messages', [])
+            if not messages:
+                return {"status": "success", "results": [], "message": "No emails found matching the query"}
             
-            messages = []
-            if 'messages' in response:
-                messages.extend(response['messages'])
-
-            while 'nextPageToken' in response:
-                page_token = response['nextPageToken']
-                response = await asyncio.to_thread(
-                    self.service.users().messages().list(
-                        userId="me", 
-                        q=query,
-                        pageToken=page_token
-                    ).execute
-                )
-                messages.extend(response['messages'])
+            email_list = []
+            for message in messages[:max_results]:
+                msg_data = self.service.users().messages().get(
+                    userId="me", id=message['id'], format="metadata"
+                ).execute()
                 
-            return messages
+                headers = msg_data.get('payload', {}).get('headers', [])
+                subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+                sender = next((h['value'] for h in headers if h['name'].lower() == 'from'), 'Unknown')
+                
+                email_list.append({
+                    'id': message['id'],
+                    'subject': subject,
+                    'from': sender
+                })
+            
+            return {"status": "success", "results": email_list}
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def list_filters(self) -> list[dict] | str:
-        """Lists all filters in the user's mailbox"""
-        try:
-            results = await asyncio.to_thread(
-                self.service.users().settings().filters().list(userId="me").execute
-            )
-            filters = results.get('filter', [])
-            return filters
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
     
     async def get_filter(self, filter_id: str) -> dict | str:
         """Gets a specific filter by ID"""
@@ -543,69 +418,72 @@ class GmailService:
             subject: Email with a specific subject
             query: Email matching a custom query
             has_attachment: Email has an attachment
-            exclude_chats: Exclude chats from filter
-            size_comparison: 'larger' or 'smaller'
-            size: Size in bytes for comparison
-            add_label_ids: Labels to add to matching emails
-            remove_label_ids: Labels to remove from matching emails
-            forward_to: Email address to forward matching emails to
+            exclude_chats: Exclude chat messages
+            size_comparison: Size comparison operator (smaller, larger)
+            size: Size in bytes
+            add_label_ids: List of label IDs to add
+            remove_label_ids: List of label IDs to remove
+            forward_to: Forward email to a specific address
+            
+        Returns:
+            Dictionary with status and filter information or error message
         """
         try:
-            # Build the filter criteria
-            criteria = {}
-            if from_email:
-                criteria['from'] = from_email
-            if to_email:
-                criteria['to'] = to_email
-            if subject:
-                criteria['subject'] = subject
-            if query:
-                criteria['query'] = query
-            if has_attachment is not None:
-                criteria['hasAttachment'] = has_attachment
-            if exclude_chats is not None:
-                criteria['excludeChats'] = exclude_chats
-            if size_comparison and size:
-                if size_comparison.lower() == 'larger':
-                    criteria['sizeComparison'] = 'larger'
-                    criteria['size'] = size
-                elif size_comparison.lower() == 'smaller':
-                    criteria['sizeComparison'] = 'smaller'
-                    criteria['size'] = size
-            
-            # Build the filter actions
-            action = {}
-            if add_label_ids:
-                action['addLabelIds'] = add_label_ids
-            if remove_label_ids:
-                action['removeLabelIds'] = remove_label_ids
-            if forward_to:
-                action['forward'] = forward_to
-            
-            # Create the filter
             filter_object = {
-                'criteria': criteria,
-                'action': action
+                'criteria': {},
+                'action': {}
             }
             
-            created_filter = await asyncio.to_thread(
-                self.service.users().settings().filters().create(
-                    userId="me", 
-                    body=filter_object
-                ).execute
-            )
+            if from_email:
+                filter_object['criteria']['from'] = from_email
+            if to_email:
+                filter_object['criteria']['to'] = to_email
+            if subject:
+                filter_object['criteria']['subject'] = subject
+            if query:
+                filter_object['criteria']['query'] = query
+            if has_attachment:
+                filter_object['criteria']['hasAttachment'] = has_attachment
+            if exclude_chats:
+                filter_object['criteria']['excludeChats'] = exclude_chats
+            if size_comparison and size:
+                filter_object['criteria']['size'] = {
+                    'size': size,
+                    'comparison': size_comparison
+                }
             
-            logger.info(f"Filter created: {created_filter['id']}")
+            if add_label_ids:
+                filter_object['action']['addLabelIds'] = add_label_ids
+            if remove_label_ids:
+                filter_object['action']['removeLabelIds'] = remove_label_ids
+            if forward_to:
+                filter_object['action']['forward'] = forward_to
+            
+            created_filter = self.service.users().settings().filters().create(
+                userId="me", body=filter_object
+            ).execute()
+            
             return {
                 'status': 'success',
                 'filter_id': created_filter['id'],
-                'filter': created_filter
+                'criteria': created_filter['criteria'],
+                'action': created_filter['action']
             }
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
     
+    async def get_filter(self, filter_id: str) -> dict | str:
+        """Gets a specific filter by ID"""
+        try:
+            filter_data = await asyncio.to_thread(
+                self.service.users().settings().filters().get(userId="me", id=filter_id).execute
+            )
+            return filter_data
+        except HttpError as error:
+            return f"An HttpError occurred: {str(error)}"
+    
     async def delete_filter(self, filter_id: str) -> str:
-        """Deletes a filter by ID"""
+        """Deletes a filter"""
         try:
             await asyncio.to_thread(
                 self.service.users().settings().filters().delete(
@@ -614,357 +492,19 @@ class GmailService:
                 ).execute
             )
             
-            logger.info(f"Filter deleted: {filter_id}")
             return f"Filter deleted successfully."
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
     
-    async def search_emails(self, query: str, max_results: int = 50) -> list[dict] | str:
-        """
-        Searches for emails using Gmail's search syntax.
-        
-        Args:
-            query: Gmail search query (e.g., 'from:example@gmail.com', 'subject:hello', etc.)
-            max_results: Maximum number of results to return (default: 50)
-            
-        Returns:
-            List of message objects or error message
-        """
-        try:
-            user_id = 'me'
-            
-            response = await asyncio.to_thread(
-                self.service.users().messages().list(
-                    userId=user_id,
-                    q=query,
-                    maxResults=max_results
-                ).execute
-            )
-            
-            messages = []
-            if 'messages' in response:
-                messages.extend(response['messages'])
-
-            # Get additional pages if available and needed
-            while 'nextPageToken' in response and len(messages) < max_results:
-                page_token = response['nextPageToken']
-                response = await asyncio.to_thread(
-                    self.service.users().messages().list(
-                        userId=user_id, 
-                        q=query,
-                        pageToken=page_token,
-                        maxResults=max_results - len(messages)
-                    ).execute
-                )
-                if 'messages' in response:
-                    messages.extend(response['messages'])
-            
-            # Get basic metadata for each message
-            result_messages = []
-            for msg in messages:
-                msg_data = await asyncio.to_thread(
-                    self.service.users().messages().get(
-                        userId=user_id,
-                        id=msg['id'],
-                        format='metadata',
-                        metadataHeaders=['Subject', 'From', 'Date']
-                    ).execute
-                )
-                
-                headers = msg_data.get('payload', {}).get('headers', [])
-                
-                subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
-                sender = next((header['value'] for header in headers if header['name'].lower() == 'from'), 'Unknown Sender')
-                date = next((header['value'] for header in headers if header['name'].lower() == 'date'), '')
-                
-                result_messages.append({
-                    'id': msg['id'],
-                    'threadId': msg['threadId'],
-                    'subject': subject,
-                    'from': sender,
-                    'date': date,
-                    'snippet': msg_data.get('snippet', '')
-                })
-                
-            return result_messages
-            
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def create_folder(self, name: str) -> dict | str:
-        """
-        Creates a new folder (implemented as a label with special handling).
-        
-        Args:
-            name: Name of the folder to create
-            
-        Returns:
-            Dictionary with status and folder information or error message
-        """
-        try:
-            # In Gmail, folders are just labels with special visibility settings
-            label_object = {
-                'name': name,
-                'labelListVisibility': 'labelShow',
-                'messageListVisibility': 'show',
-                'type': 'user'  # Ensure it's a user label
-            }
-            
-            created_label = await asyncio.to_thread(
-                self.service.users().labels().create(userId="me", body=label_object).execute
-            )
-            
-            logger.info(f"Folder created: {created_label['id']}")
-            return {
-                'status': 'success',
-                'folder_id': created_label['id'],
-                'name': created_label['name']
-            }
-        except HttpError as error:
-            return {"status": "error", "error_message": str(error)}
-    
-    async def move_to_folder(self, email_id: str, folder_id: str) -> str:
-        """
-        Moves an email to a folder by:
-        1. Applying the folder label
-        2. Removing the INBOX label (to remove from inbox)
-        
-        Args:
-            email_id: ID of the email to move
-            folder_id: ID of the folder (label) to move to
-            
-        Returns:
-            Success or error message
-        """
-        try:
-            # First, apply the folder label
-            await asyncio.to_thread(
-                self.service.users().messages().modify(
-                    userId="me", 
-                    id=email_id, 
-                    body={'addLabelIds': [folder_id], 'removeLabelIds': ['INBOX']}
-                ).execute
-            )
-            
-            logger.info(f"Email {email_id} moved to folder {folder_id}")
-            return f"Email moved to folder successfully."
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def list_folders(self) -> list[dict] | str:
-        """
-        Lists all user-created labels (folders)
-        
-        Returns:
-            List of folder information or error message
-        """
+    async def list_filters(self) -> list[dict] | str:
+        """Lists all filters"""
         try:
             results = await asyncio.to_thread(
-                self.service.users().labels().list(userId="me").execute
+                self.service.users().settings().filters().list(userId="me").execute
             )
-            labels = results.get('labels', [])
+            filters = results.get('filter', [])
             
-            # Filter to only include user-created labels (folders)
-            folders = [
-                {
-                    'id': label['id'],
-                    'name': label['name']
-                }
-                for label in labels
-                if label['type'] == 'user'
-            ]
-                
-            return folders
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def rename_label(self, label_id: str, new_name: str) -> dict | str:
-        """
-        Renames an existing label
-        
-        Args:
-            label_id: ID of the label to rename
-            new_name: New name for the label
-            
-        Returns:
-            Dictionary with status and updated label information or error message
-        """
-        try:
-            # First, get the current label to preserve its settings
-            label = await asyncio.to_thread(
-                self.service.users().labels().get(userId="me", id=label_id).execute
-            )
-            
-            # Update only the name field
-            label['name'] = new_name
-            
-            # Update the label
-            updated_label = await asyncio.to_thread(
-                self.service.users().labels().update(
-                    userId="me", 
-                    id=label_id, 
-                    body=label
-                ).execute
-            )
-            
-            logger.info(f"Label renamed: {label_id} to {new_name}")
-            return {
-                'status': 'success',
-                'label_id': updated_label['id'],
-                'name': updated_label['name']
-            }
-        except HttpError as error:
-            return {"status": "error", "error_message": str(error)}
-    
-    async def delete_label(self, label_id: str) -> str:
-        """
-        Deletes a label
-        
-        Args:
-            label_id: ID of the label to delete
-            
-        Returns:
-            Success or error message
-        """
-        try:
-            await asyncio.to_thread(
-                self.service.users().labels().delete(
-                    userId="me", 
-                    id=label_id
-                ).execute
-            )
-            
-            logger.info(f"Label deleted: {label_id}")
-            return f"Label deleted successfully."
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def archive_email(self, email_id: str) -> str:
-        """
-        Archives an email by removing the INBOX label
-        
-        Args:
-            email_id: ID of the email to archive
-            
-        Returns:
-            Success or error message
-        """
-        try:
-            await asyncio.to_thread(
-                self.service.users().messages().modify(
-                    userId="me", 
-                    id=email_id, 
-                    body={'removeLabelIds': ['INBOX']}
-                ).execute
-            )
-            
-            logger.info(f"Email archived: {email_id}")
-            return f"Email archived successfully."
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
-    
-    async def batch_archive(self, query: str, max_emails: int = 100) -> dict:
-        """
-        Archives multiple emails matching a search query
-        
-        Args:
-            query: Gmail search query to find emails to archive
-            max_emails: Maximum number of emails to archive in one batch
-            
-        Returns:
-            Dictionary with status and count of archived emails
-        """
-        try:
-            # First, search for emails matching the query
-            user_id = 'me'
-            
-            response = await asyncio.to_thread(
-                self.service.users().messages().list(
-                    userId=user_id,
-                    q=query,
-                    maxResults=max_emails
-                ).execute
-            )
-            
-            messages = []
-            if 'messages' in response:
-                messages.extend(response['messages'])
-            
-            if not messages:
-                return {
-                    'status': 'success',
-                    'archived_count': 0,
-                    'message': 'No emails found matching the query.'
-                }
-            
-            # Archive each email in the batch
-            archived_count = 0
-            for msg in messages:
-                try:
-                    await asyncio.to_thread(
-                        self.service.users().messages().modify(
-                            userId="me", 
-                            id=msg['id'], 
-                            body={'removeLabelIds': ['INBOX']}
-                        ).execute
-                    )
-                    archived_count += 1
-                except Exception as e:
-                    logger.error(f"Error archiving email {msg['id']}: {str(e)}")
-            
-            logger.info(f"Batch archived {archived_count} emails")
-            return {
-                'status': 'success',
-                'archived_count': archived_count,
-                'total_found': len(messages),
-                'message': f"Successfully archived {archived_count} out of {len(messages)} emails."
-            }
-        except HttpError as error:
-            return {
-                'status': 'error',
-                'error_message': str(error)
-            }
-    
-    async def list_archived(self, max_results: int = 50) -> list[dict] | str:
-        """
-        Lists archived emails (emails not in inbox)
-        
-        Args:
-            max_results: Maximum number of results to return
-            
-        Returns:
-            List of archived email objects or error message
-        """
-        try:
-            # Search for emails that are in "All Mail" but not in "Inbox"
-            query = "-in:inbox"
-            
-            # Use the existing search_emails method
-            return await self.search_emails(query, max_results)
-        except Exception as error:
-            return f"An error occurred: {str(error)}"
-    
-    async def restore_to_inbox(self, email_id: str) -> str:
-        """
-        Restores an archived email to the inbox
-        
-        Args:
-            email_id: ID of the email to restore
-            
-        Returns:
-            Success or error message
-        """
-        try:
-            await asyncio.to_thread(
-                self.service.users().messages().modify(
-                    userId="me", 
-                    id=email_id, 
-                    body={'addLabelIds': ['INBOX']}
-                ).execute
-            )
-            
-            logger.info(f"Email restored to inbox: {email_id}")
-            return f"Email restored to inbox successfully."
+            return filters
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
   
@@ -1634,220 +1174,102 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
     async def handle_call_tool(
         name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-
-        if name == "send-email":
-            recipient = arguments.get("recipient_id")
-            if not recipient:
-                raise ValueError("Missing recipient parameter")
-            subject = arguments.get("subject")
-            if not subject:
-                raise ValueError("Missing subject parameter")
-            message = arguments.get("message")
-            if not message:
-                raise ValueError("Missing message parameter")
-                
-            # Extract subject and message content
-            email_lines = message.split('\n')
-            if email_lines[0].startswith('Subject:'):
-                subject = email_lines[0][8:].strip()
-                message_content = '\n'.join(email_lines[1:]).strip()
-            else:
-                message_content = message
-                
-            send_response = await gmail_service.send_email(recipient, subject, message_content)
+        # Handle common error cases
+        if not arguments:
+            arguments = {}
             
-            if send_response["status"] == "success":
-                response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
-            else:
-                response_text = f"Failed to send email: {send_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+        # Simplified core email operations handlers
+        try:
+            if name == "send-email":
+                recipient = arguments.get("recipient_id")
+                subject = arguments.get("subject", "")
+                message = arguments.get("message", "")
+                
+                if not recipient:
+                    raise ValueError("Missing recipient parameter")
+                    
+                result = await gmail_service.send_email(recipient, subject, message)
+                return [types.TextContent(type="text", text=str(result))]
 
-        if name == "get-unread-emails":
+            elif name == "get-unread-emails":
+                result = await gmail_service.get_unread_emails()
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]           
+            elif name == "read-email":
+                email_id = arguments.get("email_id")
+                if not email_id:
+                    raise ValueError("Missing email ID parameter")
+                    
+                result = await gmail_service.read_email(email_id)
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "dictionary", "data": result})]            
+            elif name == "trash-email":
+                email_id = arguments.get("email_id")
+                if not email_id:
+                    raise ValueError("Missing email ID parameter")
+                    
+                result = await gmail_service.trash_email(email_id)
+                return [types.TextContent(type="text", text=str(result))]            
+            elif name == "create-draft":
+                recipient = arguments.get("recipient_id")
+                subject = arguments.get("subject", "")
+                message = arguments.get("message", "")
                 
-            unread_emails = await gmail_service.get_unread_emails()
-            return [types.TextContent(type="text", text=str(unread_emails),artifact={"type": "json", "data": unread_emails} )]
-        
-        if name == "read-email":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing email ID parameter")
+                if not recipient:
+                    raise ValueError("Missing recipient parameter")
+                    
+                result = await gmail_service.create_draft(recipient, subject, message)
+                return [types.TextContent(type="text", text=str(result))]
+            elif name == "list-labels":
+                result = await gmail_service.list_labels()
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
                 
-            retrieved_email = await gmail_service.read_email(email_id)
-            return [types.TextContent(type="text", text=str(retrieved_email),artifact={"type": "dictionary", "data": retrieved_email} )]
-        if name == "open-email":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing email ID parameter")
+            elif name == "create-label":
+                name_arg = arguments.get("name")
+                if not name_arg:
+                    raise ValueError("Missing label name parameter")
+                    
+                result = await gmail_service.create_label(name_arg)
+                return [types.TextContent(type="text", text=str(result))]
                 
-            msg = await gmail_service.open_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        if name == "trash-email":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing email ID parameter")
+            elif name == "apply-label":
+                email_id = arguments.get("email_id")
+                label_id = arguments.get("label_id")
                 
-            msg = await gmail_service.trash_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        if name == "mark-email-as-read":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing email ID parameter")
+                if not email_id or not label_id:
+                    raise ValueError("Missing email_id or label_id parameter")
+                    
+                result = await gmail_service.apply_label(email_id, label_id)
+                return [types.TextContent(type="text", text=str(result))]
+            elif name == "remove-label":
+                email_id = arguments.get("email_id")
+                label_id = arguments.get("label_id")
                 
-            msg = await gmail_service.mark_email_as_read(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "create-draft":
-            recipient_id = arguments.get("recipient_id")
-            subject = arguments.get("subject")
-            message = arguments.get("message")
-            if not recipient_id or not subject or not message:
-                raise ValueError("Missing required parameters for creating a draft")
-            draft_response = await gmail_service.create_draft(recipient_id, subject, message)
-            if draft_response["status"] == "success":
-                response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
+                if not email_id or not label_id:
+                    raise ValueError("Missing email_id or label_id parameter")
+                    
+                result = await gmail_service.remove_label(email_id, label_id)
+                return [types.TextContent(type="text", text=str(result))]
+                
+            elif name == "search-emails":
+                query = arguments.get("query")
+                max_results = arguments.get("max_results", 20)
+                
+                if not query:
+                    raise ValueError("Missing search query parameter")
+                    
+                result = await gmail_service.search_emails(query, max_results)
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
+                
             else:
-                response_text = f"Failed to create draft: {draft_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
-        elif name == "list-drafts":
-            drafts = await gmail_service.list_drafts()
-            return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
-        elif name == "list-labels":
-            labels = await gmail_service.list_labels()
-            return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]
-        elif name == "create-label":
-            name = arguments.get("name")
-            if not name:
-                raise ValueError("Missing required parameter for creating a label")
-            label_response = await gmail_service.create_label(name)
-            if label_response["status"] == "success":
-                response_text = f"Label created successfully. Label ID: {label_response['label_id']}, Name: {label_response['name']}"
-            else:
-                response_text = f"Failed to create label: {label_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
-        elif name == "apply-label":
-            email_id = arguments.get("email_id")
-            label_id = arguments.get("label_id")
-            if not email_id or not label_id:
-                raise ValueError("Missing required parameters for applying a label")
-            msg = await gmail_service.apply_label(email_id, label_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "remove-label":
-            email_id = arguments.get("email_id")
-            label_id = arguments.get("label_id")
-            if not email_id or not label_id:
-                raise ValueError("Missing required parameters for removing a label")
-            msg = await gmail_service.remove_label(email_id, label_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "search-by-label":
-            label_id = arguments.get("label_id")
-            if not label_id:
-                raise ValueError("Missing required parameter for searching by label")
-            messages = await gmail_service.search_by_label(label_id)
-            return [types.TextContent(type="text", text=str(messages), artifact={"type": "json", "data": messages})]
-        elif name == "list-filters":
-            filters = await gmail_service.list_filters()
-            return [types.TextContent(type="text", text=str(filters), artifact={"type": "json", "data": filters})]
-        elif name == "get-filter":
-            filter_id = arguments.get("filter_id")
-            if not filter_id:
-                raise ValueError("Missing required parameter for getting a filter")
-            filter_data = await gmail_service.get_filter(filter_id)
-            return [types.TextContent(type="text", text=str(filter_data), artifact={"type": "dictionary", "data": filter_data})]
-        elif name == "create-filter":
-            from_email = arguments.get("from_email")
-            to_email = arguments.get("to_email")
-            subject = arguments.get("subject")
-            query = arguments.get("query")
-            has_attachment = arguments.get("has_attachment")
-            exclude_chats = arguments.get("exclude_chats")
-            size_comparison = arguments.get("size_comparison")
-            size = arguments.get("size")
-            add_label_ids = arguments.get("add_label_ids")
-            remove_label_ids = arguments.get("remove_label_ids")
-            forward_to = arguments.get("forward_to")
-            if not from_email and not to_email and not subject and not query and has_attachment is None and exclude_chats is None and size_comparison is None and size is None and add_label_ids is None and remove_label_ids is None and forward_to is None:
-                raise ValueError("Missing required parameters for creating a filter")
-            filter_response = await gmail_service.create_filter(from_email, to_email, subject, query, has_attachment, exclude_chats, size_comparison, size, add_label_ids, remove_label_ids, forward_to)
-            if filter_response["status"] == "success":
-                response_text = f"Filter created successfully. Filter ID: {filter_response['filter_id']}, Filter: {filter_response['filter']}"
-            else:
-                response_text = f"Failed to create filter: {filter_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
-        elif name == "delete-filter":
-            filter_id = arguments.get("filter_id")
-            if not filter_id:
-                raise ValueError("Missing required parameter for deleting a filter")
-            msg = await gmail_service.delete_filter(filter_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "search-emails":
-            query = arguments.get("query")
-            max_results = arguments.get("max_results", 50)
-            if not query:
-                raise ValueError("Missing required parameter for searching emails")
-            messages = await gmail_service.search_emails(query, max_results)
-            return [types.TextContent(type="text", text=str(messages), artifact={"type": "json", "data": messages})]
-        elif name == "create-folder":
-            name = arguments.get("name")
-            if not name:
-                raise ValueError("Missing required parameter for creating a folder")
-            folder_response = await gmail_service.create_folder(name)
-            if folder_response["status"] == "success":
-                response_text = f"Folder created successfully. Folder ID: {folder_response['folder_id']}, Name: {folder_response['name']}"
-            else:
-                response_text = f"Failed to create folder: {folder_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
-        elif name == "move-to-folder":
-            email_id = arguments.get("email_id")
-            folder_id = arguments.get("folder_id")
-            if not email_id or not folder_id:
-                raise ValueError("Missing required parameters for moving an email to a folder")
-            msg = await gmail_service.move_to_folder(email_id, folder_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "list-folders":
-            folders = await gmail_service.list_folders()
-            return [types.TextContent(type="text", text=str(folders), artifact={"type": "json", "data": folders})]
-        elif name == "rename-label":
-            label_id = arguments.get("label_id")
-            new_name = arguments.get("new_name")
-            if not label_id or not new_name:
-                raise ValueError("Missing required parameters for renaming a label")
-            rename_response = await gmail_service.rename_label(label_id, new_name)
-            if rename_response["status"] == "success":
-                response_text = f"Label renamed successfully. Label ID: {rename_response['label_id']}, New name: {rename_response['name']}"
-            else:
-                response_text = f"Failed to rename label: {rename_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
-        elif name == "delete-label":
-            label_id = arguments.get("label_id")
-            if not label_id:
-                raise ValueError("Missing required parameter for deleting a label")
-            msg = await gmail_service.delete_label(label_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "archive-email":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing required parameter for archiving an email")
-            msg = await gmail_service.archive_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        elif name == "batch-archive":
-            query = arguments.get("query")
-            max_emails = arguments.get("max_emails", 100)
-            if not query:
-                raise ValueError("Missing required parameter for batch archiving")
-            archive_response = await gmail_service.batch_archive(query, max_emails)
-            return [types.TextContent(type="text", text=str(archive_response))]
-        elif name == "list-archived":
-            max_results = arguments.get("max_results", 50)
-            archived_emails = await gmail_service.list_archived(max_results)
-            return [types.TextContent(type="text", text=str(archived_emails), artifact={"type": "json", "data": archived_emails})]
-        elif name == "restore-to-inbox":
-            email_id = arguments.get("email_id")
-            if not email_id:
-                raise ValueError("Missing required parameter for restoring an email to inbox")
-            msg = await gmail_service.restore_to_inbox(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
-        else:
-            logger.error(f"Unknown tool: {name}")
-            raise ValueError(f"Unknown tool: {name}")
+                # For any other tools not explicitly handled (fewer to maintain)
+                logger.warning(f"Tool {name} not in core set, might be unsupported")
+                return [types.TextContent(type="text", text=f"The tool '{name}' is not supported in this simplified version")]
+        except ValueError as e:
+            # Handle missing parameter errors
+            return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+        except Exception as e:
+            # Handle other errors
+            logger.error(f"Error executing {name}: {str(e)}")
+            return [types.TextContent(type="text", text=f"An error occurred: {str(e)}")]
 
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
