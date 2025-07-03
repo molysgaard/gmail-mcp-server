@@ -227,10 +227,30 @@ class GmailService:
             if mime_message.is_multipart():
                 for part in mime_message.walk():
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode()
+                        payload = part.get_payload(decode=True)
+                        if isinstance(payload, bytes):
+                            # Get the correct charset from the Content-Type header
+                            charset = part.get_content_charset(failobj='utf-8')
+                            try:
+                                body = payload.decode(charset)
+                            except (UnicodeDecodeError, LookupError):
+                                # Fallback to utf-8 with error replacement if charset detection fails
+                                body = payload.decode('utf-8', errors='replace')
+                        else:
+                            body = str(payload)
                         break
             else:
-                body = mime_message.get_payload(decode=True).decode()
+                payload = mime_message.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    # Get the correct charset from the Content-Type header
+                    charset = mime_message.get_content_charset(failobj='utf-8')
+                    try:
+                        body = payload.decode(charset)
+                    except (UnicodeDecodeError, LookupError):
+                        # Fallback to utf-8 with error replacement if charset detection fails
+                        body = payload.decode('utf-8', errors='replace')
+                else:
+                    body = str(payload)
             
             # Mark email as read
             self.service.users().messages().modify(
@@ -433,36 +453,33 @@ class GmailService:
                 'criteria': {},
                 'action': {}
             }
-            
-            if from_email:
+            # Criteria fields
+            if from_email is not None:
                 filter_object['criteria']['from'] = from_email
-            if to_email:
+            if to_email is not None:
                 filter_object['criteria']['to'] = to_email
-            if subject:
+            if subject is not None:
                 filter_object['criteria']['subject'] = subject
-            if query:
+            if query is not None:
                 filter_object['criteria']['query'] = query
-            if has_attachment:
+            if has_attachment is not None:
                 filter_object['criteria']['hasAttachment'] = has_attachment
-            if exclude_chats:
+            if exclude_chats is not None:
                 filter_object['criteria']['excludeChats'] = exclude_chats
-            if size_comparison and size:
-                filter_object['criteria']['size'] = {
-                    'size': size,
-                    'comparison': size_comparison
-                }
-            
-            if add_label_ids:
+            if size is not None:
+                filter_object['criteria']['size'] = size
+            if size_comparison is not None:
+                filter_object['criteria']['sizeComparison'] = size_comparison
+            # Action fields
+            if add_label_ids is not None:
                 filter_object['action']['addLabelIds'] = add_label_ids
-            if remove_label_ids:
+            if remove_label_ids is not None:
                 filter_object['action']['removeLabelIds'] = remove_label_ids
-            if forward_to:
+            if forward_to is not None:
                 filter_object['action']['forward'] = forward_to
-            
             created_filter = self.service.users().settings().filters().create(
                 userId="me", body=filter_object
             ).execute()
-            
             return {
                 'status': 'success',
                 'filter_id': created_filter['id'],
@@ -496,17 +513,35 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
     
-    async def list_filters(self) -> list[dict] | str:
-        """Lists all filters"""
+    async def list_filters(self) -> list[dict] | dict:
+        """Lists all filters for the user using Gmail API."""
         try:
             results = await asyncio.to_thread(
                 self.service.users().settings().filters().list(userId="me").execute
             )
             filters = results.get('filter', [])
-            
-            return filters
+            return {"status": "success", "filters": filters}
         except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
+            return {"status": "error", "error_message": str(error)}
+
+    async def batch_modify_message_labels(self, ids: list[str], add_label_ids: list[str] = None, remove_label_ids: list[str] = None) -> dict:
+        """Batch modify labels on up to 1000 messages."""
+        try:
+            if not ids or not isinstance(ids, list) or len(ids) == 0:
+                return {"status": "error", "error_message": "'ids' must be a non-empty list of message IDs."}
+            if len(ids) > 1000:
+                return {"status": "error", "error_message": "Cannot modify more than 1000 messages at once."}
+            body = {"ids": ids}
+            if add_label_ids is not None:
+                body["addLabelIds"] = add_label_ids
+            if remove_label_ids is not None:
+                body["removeLabelIds"] = remove_label_ids
+            await asyncio.to_thread(
+                self.service.users().messages().batchModify(userId="me", body=body).execute
+            )
+            return {"status": "success", "message": f"Batch modify completed for {len(ids)} messages."}
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
   
 async def main(creds_file_path: str,
                token_path: str):
@@ -1168,6 +1203,31 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                     "required": ["email_id"],
                 },
             ),
+            types.Tool(
+                name="batch-modify-message-labels",
+                description="Batch modify labels on up to 1000 messages.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of message IDs to modify (max 1000)",
+                        },
+                        "add_label_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Label IDs to add to messages",
+                        },
+                        "remove_label_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Label IDs to remove from messages",
+                        },
+                    },
+                    "required": ["ids"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1258,7 +1318,41 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                     
                 result = await gmail_service.search_emails(query, max_results)
                 return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
-                
+            
+            elif name == "create-filter":
+                # Map arguments to GmailService.create_filter
+                result = await gmail_service.create_filter(
+                    from_email=arguments.get("from_email"),
+                    to_email=arguments.get("to_email"),
+                    subject=arguments.get("subject"),
+                    query=arguments.get("query"),
+                    has_attachment=arguments.get("has_attachment"),
+                    exclude_chats=arguments.get("exclude_chats"),
+                    size_comparison=arguments.get("size_comparison"),
+                    size=arguments.get("size"),
+                    add_label_ids=arguments.get("add_label_ids"),
+                    remove_label_ids=arguments.get("remove_label_ids"),
+                    forward_to=arguments.get("forward_to")
+                )
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
+            elif name == "batch-modify-message-labels":
+                ids = arguments.get("ids")
+                add_label_ids = arguments.get("add_label_ids")
+                remove_label_ids = arguments.get("remove_label_ids")
+                result = await gmail_service.batch_modify_message_labels(ids, add_label_ids, remove_label_ids)
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
+            elif name == "list-filters":
+                result = await gmail_service.list_filters()
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
+            elif name == "search-by-label":
+                label_id = arguments.get("label_id")
+                if not label_id:
+                    return [types.TextContent(type="text", text="Error: label_id is required for search-by-label.")]
+                # Use Gmail's search syntax for label. Quotes are used for label IDs/names with special characters.
+                query = f'label:"{label_id}"'
+                result = await gmail_service.search_emails(query)
+                return [types.TextContent(type="text", text=str(result), artifact={"type": "json", "data": result})]
+            
             else:
                 # For any other tools not explicitly handled (fewer to maintain)
                 logger.warning(f"Tool {name} not in core set, might be unsupported")
